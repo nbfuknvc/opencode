@@ -1,80 +1,140 @@
-import { createMemo, Match, Show, Switch } from "solid-js"
+import { type Accessor, createMemo, Match, Show, Switch } from "solid-js"
 import { useRouteData } from "@tui/context/route"
 import { useSync } from "@tui/context/sync"
-import { pipe, sumBy } from "remeda"
 import { useTheme } from "@tui/context/theme"
-import { SplitBorder } from "@tui/component/border"
-import type { AssistantMessage } from "@opencode-ai/sdk"
+import { EmptyBorder } from "@tui/component/border"
+import type { Session } from "@opencode-ai/sdk/v2"
+import { useKeybind } from "../../context/keybind"
+import { useTerminalDimensions } from "@opentui/solid"
+
+const Title = (props: { session: Accessor<Session>; truncate?: boolean }) => {
+  const { theme } = useTheme()
+  return (
+    <text fg={theme.text} wrapMode={props.truncate ? "none" : undefined} flexShrink={props.truncate ? 1 : 0}>
+      <span style={{ bold: true }}>#</span> <span style={{ bold: true }}>{props.session().title}</span>
+    </text>
+  )
+}
 
 export function Header() {
   const route = useRouteData("session")
   const sync = useSync()
-  const { theme } = useTheme()
   const session = createMemo(() => sync.session.get(route.sessionID)!)
-  const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
+  const shareEnabled = createMemo(() => sync.data.config.share !== "disabled")
+  const showShare = createMemo(() => shareEnabled() && !session()?.share?.url)
 
-  const cost = createMemo(() => {
-    const total = pipe(
-      messages(),
-      sumBy((x) => (x.role === "assistant" ? x.cost : 0)),
-    )
-    return new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: "USD",
-    }).format(total)
-  })
-
-  const context = createMemo(() => {
-    const last = messages().findLast(
-      (x) => x.role === "assistant" && x.tokens.output > 0,
-    ) as AssistantMessage
-    if (!last) return
-    const total =
-      last.tokens.input +
-      last.tokens.output +
-      last.tokens.reasoning +
-      last.tokens.cache.read +
-      last.tokens.cache.write
-    const model = sync.data.provider.find((x) => x.id === last.providerID)?.models[last.modelID]
-    let result = total.toLocaleString()
-    if (model?.limit.context) {
-      result += "/" + Math.round((total / model.limit.context) * 100) + "%"
-    }
-    return result
-  })
+  const { theme } = useTheme()
+  const keybind = useKeybind()
+  const dimensions = useTerminalDimensions()
+  const tall = createMemo(() => dimensions().height > 40)
 
   return (
-    <box
-      paddingLeft={1}
-      paddingRight={1}
-      {...SplitBorder}
-      borderColor={theme.backgroundElement}
-      flexShrink={0}
-    >
-      <text fg={theme.text}>
-        <span style={{ bold: true, fg: theme.accent }}>#</span>{" "}
-        <span style={{ bold: true }}>{session().title}</span>
-      </text>
-      <box flexDirection="row" justifyContent="space-between" gap={1}>
-        <box flexGrow={1} flexShrink={1}>
+    <box flexShrink={0}>
+      <box
+        height={1}
+        border={["left"]}
+        borderColor={theme.border}
+        customBorderChars={{
+          ...EmptyBorder,
+          vertical: theme.backgroundPanel.a !== 0 ? "╻" : " ",
+        }}
+      >
+        <box
+          height={1}
+          border={["top"]}
+          borderColor={theme.backgroundPanel}
+          customBorderChars={
+            theme.backgroundPanel.a !== 0
+              ? {
+                  ...EmptyBorder,
+                  horizontal: "▄",
+                }
+              : {
+                  ...EmptyBorder,
+                  horizontal: " ",
+                }
+          }
+        />
+      </box>
+      <box
+        border={["left"]}
+        borderColor={theme.border}
+        customBorderChars={{
+          ...EmptyBorder,
+          vertical: "┃",
+          bottomLeft: "╹",
+        }}
+      >
+        <box
+          paddingTop={tall() ? 1 : 0}
+          paddingBottom={tall() ? 1 : 0}
+          paddingLeft={2}
+          paddingRight={1}
+          flexShrink={0}
+          flexGrow={1}
+          backgroundColor={theme.backgroundPanel}
+        >
           <Switch>
-            <Match when={session().share?.url}>
-              <text fg={theme.textMuted} wrapMode="word">
-                {session().share!.url}
-              </text>
+            <Match when={session()?.parentID}>
+              <box flexDirection="row" gap={2}>
+                <text fg={theme.text}>
+                  <b>Subagent session</b>
+                </text>
+                <text fg={theme.text}>
+                  Parent <span style={{ fg: theme.textMuted }}>{keybind.print("session_parent")}</span>
+                </text>
+                <text fg={theme.text}>
+                  Prev <span style={{ fg: theme.textMuted }}>{keybind.print("session_child_cycle_reverse")}</span>
+                </text>
+                <text fg={theme.text}>
+                  Next <span style={{ fg: theme.textMuted }}>{keybind.print("session_child_cycle")}</span>
+                </text>
+                <box flexGrow={1} flexShrink={1} />
+                <Show when={showShare()}>
+                  <text fg={theme.textMuted} wrapMode="none" flexShrink={0}>
+                    /share{" "}
+                  </text>
+                </Show>
+              </box>
             </Match>
             <Match when={true}>
-              <text fg={theme.text} wrapMode="word">
-                /share <span style={{ fg: theme.textMuted }}>to create a shareable link</span>
-              </text>
+              <box flexDirection="row" justifyContent="space-between" gap={1}>
+                <Title session={session} truncate={!tall()} />
+                <Show when={showShare()}>
+                  <text fg={theme.textMuted} wrapMode="none" flexShrink={0}>
+                    /share{" "}
+                  </text>
+                </Show>
+              </box>
             </Match>
           </Switch>
         </box>
-        <Show when={context()}>
-          <text fg={theme.textMuted} wrapMode="none" flexShrink={0}>
-            {context()} ({cost()})
-          </text>
-        </Show>
+      </box>
+      <box
+        height={1}
+        border={["left"]}
+        borderColor={theme.border}
+        customBorderChars={{
+          ...EmptyBorder,
+          vertical: theme.backgroundPanel.a !== 0 ? "╹" : " ",
+        }}
+      >
+        <box
+          height={1}
+          border={["bottom"]}
+          borderColor={theme.backgroundPanel}
+          customBorderChars={
+            theme.backgroundPanel.a !== 0
+              ? {
+                  ...EmptyBorder,
+                  horizontal: "▀",
+                }
+              : {
+                  ...EmptyBorder,
+                  horizontal: " ",
+                }
+          }
+        />
       </box>
     </box>
   )

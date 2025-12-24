@@ -1,13 +1,15 @@
-import type { BoxRenderable, TextareaRenderable, KeyEvent } from "@opentui/core"
+import type { BoxRenderable, TextareaRenderable, KeyEvent, ScrollBoxRenderable } from "@opentui/core"
 import fuzzysort from "fuzzysort"
 import { firstBy } from "remeda"
-import { createMemo, createResource, createEffect, onMount, For, Show } from "solid-js"
+import { createMemo, createResource, createEffect, onMount, onCleanup, For, Show, createSignal } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useSDK } from "@tui/context/sdk"
 import { useSync } from "@tui/context/sync"
-import { useTheme } from "@tui/context/theme"
+import { useTheme, selectedForeground } from "@tui/context/theme"
 import { SplitBorder } from "@tui/component/border"
 import { useCommandDialog } from "@tui/component/dialog-command"
+import { useTerminalDimensions } from "@opentui/solid"
+import { Locale } from "@/util/locale"
 import type { PromptInfo } from "./history"
 
 export type AutocompleteRef = {
@@ -40,26 +42,58 @@ export function Autocomplete(props: {
   const sync = useSync()
   const command = useCommandDialog()
   const { theme } = useTheme()
+  const dimensions = useTerminalDimensions()
 
   const [store, setStore] = createStore({
     index: 0,
     selected: 0,
     visible: false as AutocompleteRef["visible"],
-    position: { x: 0, y: 0, width: 0 },
   })
+
+  const [positionTick, setPositionTick] = createSignal(0)
+
+  createEffect(() => {
+    if (store.visible) {
+      let lastPos = { x: 0, y: 0, width: 0 }
+      const interval = setInterval(() => {
+        const anchor = props.anchor()
+        if (anchor.x !== lastPos.x || anchor.y !== lastPos.y || anchor.width !== lastPos.width) {
+          lastPos = { x: anchor.x, y: anchor.y, width: anchor.width }
+          setPositionTick((t) => t + 1)
+        }
+      }, 50)
+
+      onCleanup(() => clearInterval(interval))
+    }
+  })
+
+  const position = createMemo(() => {
+    if (!store.visible) return { x: 0, y: 0, width: 0 }
+    const dims = dimensions()
+    positionTick()
+    const anchor = props.anchor()
+    const parent = anchor.parent
+    const parentX = parent?.x ?? 0
+    const parentY = parent?.y ?? 0
+
+    return {
+      x: anchor.x - parentX,
+      y: anchor.y - parentY,
+      width: anchor.width,
+    }
+  })
+
   const filter = createMemo(() => {
     if (!store.visible) return
     // Track props.value to make memo reactive to text changes
     props.value // <- there surely is a better way to do this, like making .input() reactive
 
-    const val = props.input().getTextRange(store.index + 1, props.input().visualCursor.offset + 1)
-
-    return val
+    return props.input().getTextRange(store.index + 1, props.input().cursorOffset)
   })
 
   function insertPart(text: string, part: PromptInfo["parts"][number]) {
     const input = props.input()
-    const currentCursorOffset = input.visualCursor.offset
+    const currentCursorOffset = input.cursorOffset
 
     const charAfterCursor = props.value.at(currentCursorOffset)
     const needsSpace = charAfterCursor !== " "
@@ -77,12 +111,7 @@ export function Autocomplete(props: {
     const extmarkStart = store.index
     const extmarkEnd = extmarkStart + Bun.stringWidth(virtualText)
 
-    const styleId =
-      part.type === "file"
-        ? props.fileStyleId
-        : part.type === "agent"
-          ? props.agentStyleId
-          : undefined
+    const styleId = part.type === "file" ? props.fileStyleId : part.type === "agent" ? props.agentStyleId : undefined
 
     const extmarkId = input.extmarks.create({
       start: extmarkStart,
@@ -115,19 +144,18 @@ export function Autocomplete(props: {
 
       // Get files from SDK
       const result = await sdk.client.find.files({
-        query: {
-          query: query ?? "",
-        },
+        query: query ?? "",
       })
 
       const options: AutocompleteOption[] = []
 
       // Add file options
       if (!result.error && result.data) {
+        const width = props.anchor().width - 4
         options.push(
           ...result.data.map(
             (item): AutocompleteOption => ({
-              display: item,
+              display: Locale.truncateMiddle(item, width),
               onSelect: () => {
                 insertPart(item, {
                   type: "file",
@@ -158,10 +186,9 @@ export function Autocomplete(props: {
   )
 
   const agents = createMemo(() => {
-    if (store.index !== 0) return []
     const agents = sync.data.agent
     return agents
-      .filter((agent) => !agent.builtIn && agent.mode !== "primary")
+      .filter((agent) => !agent.hidden && agent.mode !== "primary")
       .map(
         (agent): AutocompleteOption => ({
           display: "@" + agent.name,
@@ -180,9 +207,7 @@ export function Autocomplete(props: {
       )
   })
 
-  const session = createMemo(() =>
-    props.sessionID ? sync.session.get(props.sessionID) : undefined,
-  )
+  const session = createMemo(() => (props.sessionID ? sync.session.get(props.sessionID) : undefined))
   const commands = createMemo((): AutocompleteOption[] => {
     const results: AutocompleteOption[] = []
     const s = session()
@@ -204,7 +229,9 @@ export function Autocomplete(props: {
         {
           display: "/undo",
           description: "undo the last message",
-          onSelect: () => command.trigger("session.undo"),
+          onSelect: () => {
+            command.trigger("session.undo")
+          },
         },
         {
           display: "/redo",
@@ -218,12 +245,6 @@ export function Autocomplete(props: {
           onSelect: () => command.trigger("session.compact"),
         },
         {
-          display: "/share",
-          disabled: !!s.share?.url,
-          description: "share a session",
-          onSelect: () => command.trigger("session.share"),
-        },
-        {
           display: "/unshare",
           disabled: !s.share,
           description: "unshare a session",
@@ -235,12 +256,41 @@ export function Autocomplete(props: {
           onSelect: () => command.trigger("session.rename"),
         },
         {
+          display: "/copy",
+          description: "copy session transcript to clipboard",
+          onSelect: () => command.trigger("session.copy"),
+        },
+        {
+          display: "/export",
+          description: "export session transcript to file",
+          onSelect: () => command.trigger("session.export"),
+        },
+        {
           display: "/timeline",
           description: "jump to message",
           onSelect: () => command.trigger("session.timeline"),
         },
+        {
+          display: "/fork",
+          description: "fork from message",
+          onSelect: () => command.trigger("session.fork"),
+        },
+        {
+          display: "/thinking",
+          description: "toggle thinking visibility",
+          onSelect: () => command.trigger("session.toggle.thinking"),
+        },
       )
+      if (sync.data.config.share !== "disabled") {
+        results.push({
+          display: "/share",
+          disabled: !!s.share?.url,
+          description: "share a session",
+          onSelect: () => command.trigger("session.share"),
+        })
+      }
     }
+
     results.push(
       {
         display: "/new",
@@ -270,6 +320,11 @@ export function Autocomplete(props: {
         onSelect: () => command.trigger("opencode.status"),
       },
       {
+        display: "/mcp",
+        description: "toggle MCPs",
+        onSelect: () => command.trigger("mcp.list"),
+      },
+      {
         display: "/theme",
         description: "toggle theme",
         onSelect: () => command.trigger("theme.switch"),
@@ -278,6 +333,11 @@ export function Autocomplete(props: {
         display: "/editor",
         description: "open editor",
         onSelect: () => command.trigger("prompt.editor", "prompt"),
+      },
+      {
+        display: "/connect",
+        description: "connect to a provider",
+        onSelect: () => command.trigger("provider.connect"),
       },
       {
         display: "/help",
@@ -304,18 +364,37 @@ export function Autocomplete(props: {
     }))
   })
 
-  const options = createMemo(() => {
+  const options = createMemo((prev: AutocompleteOption[] | undefined) => {
+    const filesValue = files()
+    const agentsValue = agents()
+    const commandsValue = commands()
+
     const mixed: AutocompleteOption[] = (
-      store.visible === "@"
-        ? [...agents(), ...(files.loading ? files.latest || [] : files())]
-        : [...commands()]
+      store.visible === "@" ? [...agentsValue, ...(filesValue || [])] : [...commandsValue]
     ).filter((x) => x.disabled !== true)
+
     const currentFilter = filter()
-    if (!currentFilter) return mixed.slice(0, 10)
+
+    if (!currentFilter) {
+      return mixed
+    }
+
+    if (files.loading && prev && prev.length > 0) {
+      return prev
+    }
+
     const result = fuzzysort.go(currentFilter, mixed, {
-      keys: ["display", "description", (obj) => obj.aliases?.join(" ") ?? ""],
+      keys: [(obj) => obj.display.trimEnd(), "description", (obj) => obj.aliases?.join(" ") ?? ""],
       limit: 10,
+      scoreFn: (objResults) => {
+        const displayResult = objResults[0]
+        if (displayResult && displayResult.target.startsWith(store.visible + currentFilter)) {
+          return objResults.score * 2
+        }
+        return objResults.score
+      },
     })
+
     return result.map((arr) => arr.obj)
   })
 
@@ -330,34 +409,45 @@ export function Autocomplete(props: {
     let next = store.selected + direction
     if (next < 0) next = options().length - 1
     if (next >= options().length) next = 0
+    moveTo(next)
+  }
+
+  function moveTo(next: number) {
     setStore("selected", next)
+    if (!scroll) return
+    const viewportHeight = Math.min(height(), options().length)
+    const scrollBottom = scroll.scrollTop + viewportHeight
+    if (next < scroll.scrollTop) {
+      scroll.scrollBy(next - scroll.scrollTop)
+    } else if (next + 1 > scrollBottom) {
+      scroll.scrollBy(next + 1 - scrollBottom)
+    }
   }
 
   function select() {
     const selected = options()[store.selected]
     if (!selected) return
-    selected.onSelect?.()
     hide()
+    selected.onSelect?.()
   }
 
   function show(mode: "@" | "/") {
     command.keybinds(false)
     setStore({
       visible: mode,
-      index: props.input().visualCursor.offset,
-      position: {
-        x: props.anchor().x,
-        y: props.anchor().y,
-        width: props.anchor().width,
-      },
+      index: props.input().cursorOffset,
     })
   }
 
   function hide() {
     const text = props.input().plainText
-    if (store.visible === "/" && !text.endsWith(" ")) {
+    if (store.visible === "/" && !text.endsWith(" ") && text.startsWith("/")) {
       const cursor = props.input().logicalCursor
       props.input().deleteRange(0, 0, cursor.row, cursor.col)
+      // Sync the prompt store immediately since onContentChange is async
+      props.setPrompt((draft) => {
+        draft.input = props.input().plainText
+      })
     }
     command.keybinds(true)
     setStore("visible", false)
@@ -368,36 +458,60 @@ export function Autocomplete(props: {
       get visible() {
         return store.visible
       },
-      onInput(value: string) {
-        if (store.visible && Bun.stringWidth(value) <= store.index) hide()
+      onInput(value) {
+        if (store.visible) {
+          if (
+            // Typed text before the trigger
+            props.input().cursorOffset <= store.index ||
+            // There is a space between the trigger and the cursor
+            props.input().getTextRange(store.index, props.input().cursorOffset).match(/\s/) ||
+            // "/<command>" is not the sole content
+            (store.visible === "/" && value.match(/^\S+\s+\S+\s*$/))
+          ) {
+            hide()
+            return
+          }
+        }
       },
       onKeyDown(e: KeyEvent) {
         if (store.visible) {
-          if (e.name === "up") move(-1)
-          if (e.name === "down") move(1)
-          if (e.name === "escape") hide()
-          if (e.name === "return" || e.name === "tab") select()
-          if (["up", "down", "return", "tab", "escape"].includes(e.name)) e.preventDefault()
+          const name = e.name?.toLowerCase()
+          const ctrlOnly = e.ctrl && !e.meta && !e.shift
+          const isNavUp = name === "up" || (ctrlOnly && name === "p")
+          const isNavDown = name === "down" || (ctrlOnly && name === "n")
+
+          if (isNavUp) {
+            move(-1)
+            e.preventDefault()
+            return
+          }
+          if (isNavDown) {
+            move(1)
+            e.preventDefault()
+            return
+          }
+          if (name === "escape") {
+            hide()
+            e.preventDefault()
+            return
+          }
+          if (name === "return" || name === "tab") {
+            select()
+            e.preventDefault()
+            return
+          }
         }
         if (!store.visible) {
           if (e.name === "@") {
-            const cursorOffset = props.input().visualCursor.offset
+            const cursorOffset = props.input().cursorOffset
             const charBeforeCursor =
-              cursorOffset === 0
-                ? undefined
-                : props.input().getTextRange(cursorOffset - 1, cursorOffset)
-
-            if (
-              charBeforeCursor === " " ||
-              charBeforeCursor === "\n" ||
-              charBeforeCursor === undefined
-            ) {
-              show("@")
-            }
+              cursorOffset === 0 ? undefined : props.input().getTextRange(cursorOffset - 1, cursorOffset)
+            const canTrigger = charBeforeCursor === undefined || charBeforeCursor === "" || /\s/.test(charBeforeCursor)
+            if (canTrigger) show("@")
           }
 
           if (e.name === "/") {
-            if (props.input().visualCursor.offset === 0) show("/")
+            if (props.input().cursorOffset === 0) show("/")
           }
         }
       },
@@ -409,23 +523,30 @@ export function Autocomplete(props: {
     return 1
   })
 
+  let scroll: ScrollBoxRenderable
+
   return (
     <box
       visible={store.visible !== false}
       position="absolute"
-      top={store.position.y - height()}
-      left={store.position.x}
-      width={store.position.width}
+      top={position().y - height()}
+      left={position().x}
+      width={position().width}
       zIndex={100}
       {...SplitBorder}
       borderColor={theme.border}
     >
-      <box backgroundColor={theme.backgroundElement} height={height()}>
+      <scrollbox
+        ref={(r: ScrollBoxRenderable) => (scroll = r)}
+        backgroundColor={theme.backgroundMenu}
+        height={height()}
+        scrollbarOptions={{ visible: false }}
+      >
         <For
           each={options()}
           fallback={
             <box paddingLeft={1} paddingRight={1}>
-              <text>No matching items</text>
+              <text fg={theme.textMuted}>No matching items</text>
             </box>
           }
         >
@@ -436,21 +557,18 @@ export function Autocomplete(props: {
               backgroundColor={index() === store.selected ? theme.primary : undefined}
               flexDirection="row"
             >
-              <text fg={index() === store.selected ? theme.background : theme.text} flexShrink={0}>
+              <text fg={index() === store.selected ? selectedForeground(theme) : theme.text} flexShrink={0}>
                 {option.display}
               </text>
               <Show when={option.description}>
-                <text
-                  fg={index() === store.selected ? theme.background : theme.textMuted}
-                  wrapMode="none"
-                >
+                <text fg={index() === store.selected ? selectedForeground(theme) : theme.textMuted} wrapMode="none">
                   {option.description}
                 </text>
               </Show>
             </box>
           )}
         </For>
-      </box>
+      </scrollbox>
     </box>
   )
 }
